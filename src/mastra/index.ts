@@ -177,7 +177,10 @@ const pilotTransitionPolicy: BoardTransitionPolicy = async context => {
     return {
       type: 'reject',
       code: 'approval_required',
-      reason: `The administrator must move this card into ${context.toStage} from the Factory UI.`,
+      reason:
+        `Transition into ${context.toStage} is reserved for the administrator, who moves the card in the Factory UI. ` +
+        'Your work in the current phase is complete and recorded. Do not retry this transition or search for ' +
+        'another way to advance the card. End the session now.',
     };
   }
   return base;
