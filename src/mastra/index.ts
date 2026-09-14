@@ -31,6 +31,12 @@ import { DEFAULT_RETENTION } from '@mastra/code-sdk/utils/storage-maintenance';
 import { MastraAuthWorkos } from '@mastra/auth-workos';
 import { createFactorySecretEncryption, MastraFactory } from '@mastra/factory';
 import { GithubIntegration } from '@mastra/factory/integrations/github/integration';
+import { PlatformGithubIntegration } from '@mastra/factory/integrations/platform/github/integration';
+import { defaultGithubRules } from '@mastra/factory/integrations/github/default-rules';
+import type { GithubRuleOverrides } from '@mastra/factory/integrations/github/default-rules';
+import { defineBoard, workBoard } from '@mastra/factory/boards';
+import type { BoardTransitionPolicy } from '@mastra/factory/boards';
+import type { FactoryGithubRuleContext } from '@mastra/factory/rules/types';
 import { parseAuthorizedBotsEnv } from '@mastra/factory/integrations/github/webhook';
 import { LinearIntegration } from '@mastra/factory/integrations/linear/integration';
 import { SlackIntegration } from '@mastra/factory/integrations/slack/integration';
@@ -143,6 +149,93 @@ if (authDisabled) {
 }
 const secretEncryption = auth === null ? undefined : credentialEncryption();
 
+
+// ---------------------------------------------------------------------------
+// Pilot board and GitHub rules (wayfinder ticket 11, 2026-09-14)
+//
+// Goal: an issue carrying the `factory` label flows Intake → Triage → Planning
+// → Build → Review, with Triage starting on its own and every later phase
+// waiting for the administrator to move the card in the Factory UI.
+//
+// The built-in Work board only gates non-bug items and never gates Review, and
+// its id is reserved, so the pilot installs its own board that reuses the Work
+// board's phases (same stage names, same onEnter handlers) under a stricter
+// transition policy. The Work board's `submit_plan` tool rule is deliberately
+// not carried over: after a plan is approved the card stays in Planning until
+// a person moves it to Build.
+// ---------------------------------------------------------------------------
+const PILOT_BOARD_ID = 'engineering';
+const ELIGIBLE_LABEL = 'factory';
+const HUMAN_GATED_PHASES: ReadonlySet<string> = new Set(['planning', 'execute', 'review']);
+
+const pilotTransitionPolicy: BoardTransitionPolicy = async context => {
+  // Keep the Work board's triage bookkeeping (classification persistence,
+  // non-bug protection), then add the pilot's uniform human gate on top.
+  const base = await workBoard.transitionPolicy?.(context);
+  if (base?.type === 'reject') return base;
+  if (HUMAN_GATED_PHASES.has(context.toStage) && !context.isHumanTransition) {
+    return {
+      type: 'reject',
+      code: 'approval_required',
+      reason: `The administrator must move this card into ${context.toStage} from the Factory UI.`,
+    };
+  }
+  return base;
+};
+
+const pilotBoard = defineBoard({
+  id: PILOT_BOARD_ID,
+  title: 'Engineering',
+  initialPhase: workBoard.initialPhase,
+  phases: workBoard.phases,
+  transitionPolicy: pilotTransitionPolicy,
+});
+
+// The default GitHub rules address the built-in Work board by id in a few
+// places (issue closed, review feedback, PR comments). For cards on the pilot
+// board, evaluate the default rule as if the card were on Work and rewrite any
+// resulting `board: 'work'` back to the pilot board.
+type GithubRule = (context: FactoryGithubRuleContext) => unknown;
+function onPilotBoard<R extends GithubRule>(rule: R): R {
+  const wrapped = (context: FactoryGithubRuleContext) => {
+    if (context.board !== PILOT_BOARD_ID) return rule(context);
+    const decision = rule({ ...context, board: 'work' });
+    if (decision && typeof decision === 'object' && 'board' in decision && decision.board === 'work') {
+      return { ...decision, board: PILOT_BOARD_ID };
+    }
+    return decision;
+  };
+  return wrapped as R;
+}
+
+const pilotGithubRules: GithubRuleOverrides = {};
+for (const [event, rule] of Object.entries(defaultGithubRules) as [keyof GithubRuleOverrides, GithubRule][]) {
+  pilotGithubRules[event] = onPilotBoard(rule) as GithubRuleOverrides[typeof event];
+}
+
+// Issue-opened events: only `factory`-labelled issues become cards, and they
+// land on the pilot board. (On the hosted platform, issue creation is mostly
+// surfaced through the Intake list rather than this event; the rule still
+// applies wherever the event is ingested.)
+pilotGithubRules.issueOpened = context => {
+  const labels = (context.issue?.labels ?? []).map(label => label.toLowerCase());
+  if (!labels.includes(ELIGIBLE_LABEL)) return undefined;
+  return defaultGithubRules.issueOpened({
+    ...context,
+    intake: { board: PILOT_BOARD_ID, initialPhase: pilotBoard.initialPhase },
+  });
+};
+
+// Pull requests: never auto-start the review run. The PR card waits in the
+// Review board's Intake until the administrator moves it to Reviewing.
+pilotGithubRules.pullRequestOpened = context => {
+  const decision = defaultGithubRules.pullRequestOpened(context);
+  return decision ? { ...decision, metadata: { ...decision.metadata, autoStartCandidate: false } } : decision;
+};
+
+const platformGithubConfigured =
+  Boolean(process.env.MASTRA_PLATFORM_SECRET_KEY?.trim() || process.env.MASTRA_PLATFORM_ACCESS_TOKEN?.trim());
+
 // Direct GitHub App fallback: when the platform-backed integration isn't in
 // play (self-hosted / local deploys), a complete GITHUB_APP_* env group wires
 // a GithubIntegration so the app still gets a real GitHub connection — Connect
@@ -165,8 +258,11 @@ const github =
         // Extra reviewer bot logins this deployment trusts to trigger
         // review/comment notifications, on top of the built-in defaults.
         authorizedBots: parseAuthorizedBotsEnv(process.env.MASTRACODE_GITHUB_AUTHORIZED_BOTS),
+        rules: pilotGithubRules,
       })
-    : undefined;
+    : platformGithubConfigured
+      ? new PlatformGithubIntegration({ rules: pilotGithubRules, slug: githubAppSlug })
+      : undefined;
 
 // Direct Linear OAuth fallback for self-hosted / local deploys. As with the
 // GitHub fallback, only a complete credential group enables the integration;
@@ -278,7 +374,7 @@ const slack = slackSigningSecret
 
 const integrations = [...(github ? [github] : []), ...(linear ? [linear] : []), ...(slack ? [slack] : [])];
 
-export const factoryConfigVersion = 'mastracode-web-v1';
+export const factoryConfigVersion = 'pilot-engineering-board-v1';
 
 const hasPlatformSandboxEnv =
   ['MASTRA_PLATFORM_ACCESS_TOKEN', 'MASTRA_PLATFORM_SECRET_KEY'].some(key => Boolean(process.env[key]?.trim())) &&
@@ -287,6 +383,8 @@ export const factory = new MastraFactory({
   auth,
   secretEncryption,
   integrations,
+  boards: [pilotBoard],
+  includeDefaultBoards: true,
   configVersion: factoryConfigVersion,
   sandbox: ctx => {
     const useLocalSandbox = process.env.FACTORY_SANDBOX_PROVIDER?.trim() === 'local';
