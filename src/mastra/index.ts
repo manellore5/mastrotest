@@ -17,6 +17,14 @@
  * the server.
  */
 
+// Outbound HTTP: force HTTP/1.1 with a short keep-alive. Node 26's bundled
+// fetch enables HTTP/2 by default, and a model call issued after a long tool
+// step (build, tests) reused a stale HTTP/2 session, failing the run with
+// "Cannot connect to API: The session has been destroyed" (pilot rehearsal,
+// 2026-09-14, twice at the same step). Must run before anything opens a socket.
+import { Agent, setGlobalDispatcher } from 'undici';
+setGlobalDispatcher(new Agent({ allowH2: false, keepAliveTimeout: 10_000, keepAliveMaxTimeout: 10_000 }));
+
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Mastra } from '@mastra/core/mastra';
